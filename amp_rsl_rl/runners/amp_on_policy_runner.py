@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
 import rsl_rl
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
+from rsl_rl.modules import MLPModel
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 
 import amp_rsl_rl
@@ -128,7 +128,8 @@ class AMPOnPolicyRunner:
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
-        self.policy_cfg = train_cfg["policy"]
+        self.actor_cfg = train_cfg["policy"]
+        self.critic_cfg = train_cfg["critic"]
         self.discriminator_cfg = train_cfg["discriminator"]
         self.dataset_cfg = train_cfg["dataset"]
         self.device = device
@@ -140,15 +141,26 @@ class AMPOnPolicyRunner:
             observations, self.cfg.get("obs_groups"), default_sets
         )
 
-        actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
-        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticMoE = (
-            actor_critic_class(
-                observations,
-                self.cfg["obs_groups"],
-                self.env.num_actions,
-                **self.policy_cfg,
-            ).to(self.device)
-        )
+        actor_class = eval(self.actor_cfg.get("class_name", "MLPModel"))
+        critic_class = eval(self.critic_cfg.get("class_name", "MLPModel"))
+        
+        actor: MLPModel = actor_class(
+            observations,
+            self.cfg["obs_groups"],
+            "actor",
+            self.env.num_actions,
+            **self.actor_cfg,
+        ).to(self.device)
+        
+        critic: MLPModel = critic_class(
+            observations,
+            self.cfg["obs_groups"],
+            "critic",
+            1,
+            **self.critic_cfg,
+        ).to(self.device)
+        
+        
         # NOTE: to use this we need to configure the observations in the env coherently with amp observation. Tested with Manager Based envs in Isaaclab
         amp_joint_names = self.env.cfg.observations.amp.joint_pos.params[
             "asset_cfg"
@@ -187,7 +199,8 @@ class AMPOnPolicyRunner:
                 self.alg_cfg.pop(key)
 
         self.alg: AMP_PPO = alg_class(
-            actor_critic=actor_critic,
+            actor=actor,
+            critic=critic,
             discriminator=self.discriminator,
             amp_data=amp_data,
             device=self.device,

@@ -14,7 +14,7 @@ import torch.optim as optim
 from tensordict import TensorDict
 
 # External modules providing the actor-critic model, storage utilities, and AMP components.
-from rsl_rl.modules import ActorCritic
+from rsl_rl.modules import MLPModel
 from rsl_rl.storage import RolloutStorage
 
 from amp_rsl_rl.storage import ReplayBuffer
@@ -32,8 +32,10 @@ class AMP_PPO:
 
     Parameters
     ----------
-    actor_critic : ActorCritic
-        Policy network providing ``act``/``evaluate``/``update_normalization`` APIs.
+    actor: MLPModel
+        Actor network defining the policy architecture.
+    critic: MLPModel
+        Critic network defining the value function architecture.
     discriminator : Discriminator
         AMP discriminator distinguishing expert vs policy motion pairs.
     amp_data : AMPLoader
@@ -70,11 +72,13 @@ class AMP_PPO:
         Torch device used by the module.
     """
 
-    actor_critic: ActorCritic
+    actor: MLPModel
+    critic: MLPModel
 
     def __init__(
         self,
-        actor_critic: ActorCritic,
+        actor: MLPModel,
+        critic: MLPModel,
         discriminator: Discriminator,
         amp_data: AMPLoader,
         num_learning_epochs: int = 1,
@@ -111,8 +115,10 @@ class AMP_PPO:
         self.amp_data: AMPLoader = amp_data
 
         # Set up the actor-critic (policy) and move it to the device.
-        self.actor_critic = actor_critic
-        self.actor_critic.to(self.device)
+        self.actor = actor
+        self.critic = critic
+        self.actor.to(self.device)
+        self.critic.to(self.device)
         self.storage: Optional[RolloutStorage] = (
             None  # Will be initialized later once environment parameters are known
         )
@@ -120,7 +126,8 @@ class AMP_PPO:
         # Create optimizer for both the actor-critic and the discriminator.
         # Note: Weight decay is set differently for discriminator trunk and head.
         params = [
-            {"params": self.actor_critic.parameters(), "name": "actor_critic"},
+            {"params": self.actor.parameters(), "name": "actor"},
+            {"params": self.critic.parameters(), "name": "critic"},
             {
                 "params": self.discriminator.trunk.parameters(),
                 "weight_decay": 10e-4,
@@ -179,13 +186,15 @@ class AMP_PPO:
         """
         Sets the actor-critic model to evaluation mode.
         """
-        self.actor_critic.eval()
+        self.actor.eval()
+        self.critic.eval()
 
     def train_mode(self) -> None:
         """
         Sets the actor-critic model to training mode.
         """
-        self.actor_critic.train()
+        self.actor.train()
+        self.critic.train()
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Select an action and value estimate for the current observation.
@@ -200,16 +209,16 @@ class AMP_PPO:
         torch.Tensor
             Detached action tensor sampled from the actor-critic policy.
         """
-        if self.actor_critic.is_recurrent:
-            self.transition.hidden_states = self.actor_critic.get_hidden_states()
+        if self.actor.is_recurrent:
+            self.transition.hidden_states = self.actor.get_hidden_states()
 
-        self.transition.actions = self.actor_critic.act(obs).detach()
-        self.transition.values = self.actor_critic.evaluate(obs).detach()
-        self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(
+        self.transition.actions = self.actor.act(obs).detach()
+        self.transition.values = self.critic.evaluate(obs).detach()
+        self.transition.actions_log_prob = self.actor.get_actions_log_prob(
             self.transition.actions
         ).detach()
-        self.transition.action_mean = self.actor_critic.action_mean.detach()
-        self.transition.action_sigma = self.actor_critic.action_std.detach()
+        self.transition.action_mean = self.actor.action_mean.detach()
+        self.transition.action_sigma = self.actor.action_std.detach()
         self.transition.observations = obs
         return self.transition.actions
 
@@ -243,7 +252,8 @@ class AMP_PPO:
         extras : dict[str, Any]
             Additional metadata from the environment (e.g. ``time_outs``).
         """
-        self.actor_critic.update_normalization(obs)
+        self.actor.update_normalization(obs)
+        self.critic.update_normalization(obs)
 
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
@@ -257,7 +267,8 @@ class AMP_PPO:
 
         self.storage.add_transitions(self.transition)
         self.transition.clear()
-        self.actor_critic.reset(dones)
+        self.actor.reset(dones)
+        self.critic.reset(dones)
 
     def process_amp_step(self, amp_obs: torch.Tensor) -> None:
         """Insert a policy-generated AMP transition into the replay buffer.
@@ -279,7 +290,7 @@ class AMP_PPO:
             Last observation gathered after rollout completion.
         """
 
-        last_values = self.actor_critic.evaluate(obs).detach()
+        last_values = self.critic.evaluate(obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
 
     def update(
@@ -312,7 +323,7 @@ class AMP_PPO:
         mean_kl_divergence: float = 0.0
 
         # Create data generators for mini-batch sampling.
-        if self.actor_critic.is_recurrent:
+        if self.actor.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(
                 self.num_mini_batches, self.num_learning_epochs
             )
@@ -361,18 +372,18 @@ class AMP_PPO:
                 hidden_state_actor, hidden_state_critic = hidden_states_batch
 
             # Forward pass through the actor to get current policy outputs.
-            self.actor_critic.act(
+            self.actor.act(
                 obs_batch, masks=masks_batch, hidden_states=hidden_state_actor
             )
-            actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
+            actions_log_prob_batch = self.actor.get_actions_log_prob(
                 actions_batch
             )
-            value_batch = self.actor_critic.evaluate(
+            value_batch = self.critic.evaluate(
                 obs_batch, masks=masks_batch, hidden_states=hidden_state_critic
             )
-            mu_batch = self.actor_critic.action_mean
-            sigma_batch = self.actor_critic.action_std
-            entropy_batch = self.actor_critic.entropy
+            mu_batch = self.actor.action_mean
+            sigma_batch = self.actor.action_std
+            entropy_batch = self.actor.entropy
 
             # Adaptive learning rate adjustment based on KL divergence if schedule is "adaptive".
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -484,7 +495,8 @@ class AMP_PPO:
             # Backpropagation and optimizer step.
             self.optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
             # Update the normalizer with RAW (unnormalized) observations under no_grad
